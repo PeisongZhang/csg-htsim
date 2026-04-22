@@ -8,6 +8,7 @@
 
 //#include <list>
 //#include "circular_buffer.h"
+#include <math.h>
 #include "config.h"
 #include "eventlist.h"
 #include "network.h"
@@ -49,14 +50,29 @@ class BaseQueue  : public EventSource, public PacketSink, public Drawable {
     virtual const string& nodename() { return _nodename; }
     virtual mem_b queuesize() const = 0;
     virtual mem_b maxsize() const = 0;
-    
-    inline simtime_picosec drainTime(Packet *pkt) { 
-            return (simtime_picosec)(pkt->size() * _ps_per_byte); 
+
+    inline simtime_picosec drainTime(Packet *pkt) {
+            return (simtime_picosec)(pkt->size() * _ps_per_byte);
     }
 
-    inline mem_b serviceCapacity(simtime_picosec t) { 
-            return (mem_b)(timeAsSec(t) * (double)_bitrate); 
+    inline mem_b serviceCapacity(simtime_picosec t) {
+            return (mem_b)(timeAsSec(t) * (double)_bitrate);
     }
+
+    // AstraSim/OCS hook — dynamically change the queue service rate at run
+    // time.  When new_bitrate == 0 the queue still enqueues packets but
+    // beginService starves; callers should treat it as link-down.  Recomputes
+    // the cached picosec-per-byte.  Safe to call from inside a scheduled
+    // EventSource, the new rate takes effect for subsequent beginService calls.
+    virtual void setBitrate(linkspeed_bps new_bitrate) {
+            _bitrate = new_bitrate;
+            if (_bitrate > 0) {
+                _ps_per_byte = (simtime_picosec)((pow(10.0, 12.0) * 8) / _bitrate);
+            } else {
+                _ps_per_byte = 0;  // logical link-down — service paused
+            }
+    }
+    linkspeed_bps bitrate() const { return _bitrate; }
 
     virtual void log_packet_send(simtime_picosec duration);
     virtual uint16_t average_utilization();

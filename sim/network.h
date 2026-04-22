@@ -155,6 +155,10 @@ class Packet {
     void set_ingress_queue(LosslessInputQueue* t){assert(!_ingressqueue); _ingressqueue = t;}
     LosslessInputQueue* get_ingress_queue(){assert(_ingressqueue); return _ingressqueue;}
     void clear_ingress_queue(){assert(_ingressqueue); _ingressqueue = NULL;}
+    // AstraSim: non-asserting probe used to detect the first-hop case where
+    // a sender (RoceSrc/TcpSrc) invokes sendOn() without going through a
+    // LosslessInputQueue, so the packet has no ingress tag yet.
+    bool has_ingress_queue() const { return _ingressqueue != NULL; }
 
     //    void set_detour(PacketSink* n, int rewind) {_detour = n;_nexthop -= rewind;}
     

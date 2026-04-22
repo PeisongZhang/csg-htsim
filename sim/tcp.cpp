@@ -184,7 +184,25 @@ TcpSrc::receivePacket(Packet& pkt)
         _rto = timeFromSec(.25);
 
     if (seqno >= _flow_size){
-        cout << "Flow " << nodename() << " finished at " << timeAsMs(eventlist().now()) << endl;        
+        // §11.3 lever #3: gate verbose per-flow stdout behind ASTRASIM_HTSIM_VERBOSE env var.
+        static const bool _astrasim_verbose = (std::getenv("ASTRASIM_HTSIM_VERBOSE") != nullptr);
+        if (_astrasim_verbose) {
+            cout << "Flow " << nodename() << " finished at " << timeAsMs(eventlist().now()) << endl;
+        }
+        // AstraSim entry point
+        // Use IDs memorized at point of adding the flow, as well as unique src tag for the transition
+        // Gate on _astrasim_send_finished so the callback fires exactly once: duplicate / RTO ACKs
+        // after the flow is "done" otherwise re-trigger notify_sender_sending_finished which asserts.
+        if (astrasim_flow_finish_send_cb && !_astrasim_send_finished) {
+            _astrasim_send_finished = true;
+            int tag = _flow.flow_id();
+            int src_id = _debug_srcid;
+            int dst_id = _debug_dstid;
+            if (_astrasim_verbose) {
+                std::cout << "Finish sending flow " << tag << " from " << src_id << " to " << dst_id << std::endl;
+            }
+            astrasim_flow_finish_send_cb(src_id, dst_id, _flow_size, tag);
+        }
     }
   
     if (seqno > _last_acked) { // a brand new ack
@@ -681,6 +699,23 @@ TcpSink::receivePacket(Packet& pkt) {
             }
         }
     }
+
+    // AstraSim entry point
+    // Use IDs memorized at point of adding the flow, as well as unique src tag for the transition
+    // Gate on _astrasim_recv_finished so the callback fires exactly once per flow.
+    if (_cumulative_ack >= _src->_flow_size && astrasim_flow_finish_recv_cb && !_astrasim_recv_finished) {
+        _astrasim_recv_finished = true;
+        int tag = _src->getFlowId();
+        int src_id = _debug_srcid;
+        int dst_id = _debug_dstid;
+        // §11.3 lever #3: gate behind ASTRASIM_HTSIM_VERBOSE.
+        static const bool _astrasim_verbose_sink = (std::getenv("ASTRASIM_HTSIM_VERBOSE") != nullptr);
+        if (_astrasim_verbose_sink) {
+            std::cout << "Finish receiving flow " << tag << " from " << src_id << " to " << dst_id << std::endl;
+        }
+        astrasim_flow_finish_recv_cb(src_id, dst_id, _src->_flow_size, tag);
+    }
+
     send_ack(ts,marked);
 }
 

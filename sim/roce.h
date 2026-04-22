@@ -120,6 +120,34 @@ public:
 
     PacketFlow _flow;
 
+    // AstraSim hooks
+    void (*astrasim_flow_finish_send_cb)(int, int, int, int) = nullptr;
+    int _debug_srcid = -1;
+    int _debug_dstid = -1;
+    bool _astrasim_send_finished = false;
+
+    // AstraSim U3 — DCQCN AIMD congestion control.  Off by default; the
+    // DCQCN frontend flips _cc_dcqcn on at connect time via enable_dcqcn().
+    // Parameters follow DCQCN paper (SIGCOMM'15) in simplified form.
+    bool _cc_dcqcn = false;
+    double _cc_alpha = 0.0;
+    double _cc_g = 1.0 / 16.0;
+    linkspeed_bps _cc_current_bps = 0;
+    linkspeed_bps _cc_target_bps = 0;
+    linkspeed_bps _cc_ai_bps = 5000000ULL;
+    linkspeed_bps _cc_min_bps = 100000000ULL;
+    uint64_t _cc_bytes_since_update = 0;
+    uint64_t _cc_update_byte_threshold = 1 << 17;
+    uint32_t _cc_incstage = 0;
+    uint32_t _cc_unmarked_runs = 0;
+    uint32_t _cc_marked_ack_ct = 0;
+    uint32_t _cc_unmarked_ack_ct = 0;
+
+    void enable_dcqcn(linkspeed_bps ai_bps = 0,
+                      linkspeed_bps min_bps = 0,
+                      uint64_t byte_threshold = 0,
+                      double g = 0.0);
+
 private:
     // Housekeeping
     RoceLogger* _logger;
@@ -166,7 +194,13 @@ public:
     bool _log_me;
 
     uint32_t _srcaddr;
-    
+
+    // AstraSim hooks
+    void (*astrasim_flow_finish_recv_cb)(int, int, int, int) = nullptr;
+    int _debug_srcid = -1;
+    int _debug_dstid = -1;
+    bool _astrasim_recv_finished = false;
+
 private:
  
     // Connectivity
@@ -186,7 +220,8 @@ private:
     RocePacket::seq_t _highest_seqno;
  
     // Mechanism
-    void send_ack(simtime_picosec ts);
+    // AstraSim U3 — optional ECN_ECHO bit when the data packet arrived marked.
+    void send_ack(simtime_picosec ts, bool ecn_echo = false);
     void send_nack(simtime_picosec ts, RocePacket::seq_t ackno);
 };
 

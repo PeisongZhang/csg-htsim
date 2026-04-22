@@ -2,11 +2,13 @@
 #include <math.h>
 #include <iostream>
 #include <algorithm>
+#include <cstdlib>
 #include "roce.h"
 #include "queue.h"
 #include <stdio.h>
 #include "switch.h"
 #include "trigger.h"
+#include "ecn.h"   // AstraSim U3 — ECN_CE / ECN_ECHO
 using namespace std;
 
 ////////////////////////////////////////////////////////////////
@@ -62,7 +64,10 @@ RoceSrc::RoceSrc(RoceLogger* logger, TrafficLogger* pktlogger, EventList &eventl
     _node_num = _global_node_count++;
     _nodename = "rocesrc " + to_string(_node_num);
 
-    srand(time(NULL));
+    // AstraSim: upstream re-seeds rand() from wall-time on every RoceSrc
+    // construction.  With thousands of flows that causes subtle run-to-run
+    // non-determinism in RTO jitter and path selection.  HTSim frontend
+    // seeds rand()/random() once during session init instead.
     _pathid = random()%256;
 
     //cout << _nodename << " path id is " << _pathid << endl;
@@ -75,6 +80,36 @@ RoceSrc::RoceSrc(RoceLogger* logger, TrafficLogger* pktlogger, EventList &eventl
     _state_send = READY;
     _time_last_sent = 0;
     _packet_spacing = (simtime_picosec)((Packet::data_packet_size()+RocePacket::ACKSIZE) * (pow(10.0,12.0) * 8) / _bitrate);
+
+    // AstraSim U3 — DCQCN defaults (overridden by enable_dcqcn if called).
+    _cc_current_bps = _bitrate;
+    _cc_target_bps = _bitrate;
+    uint64_t ai = _bitrate / 100;
+    if (ai < 1000000ULL) ai = 1000000ULL;
+    if (ai > 50000000ULL) ai = 50000000ULL;
+    _cc_ai_bps = ai;
+    uint64_t minr = _bitrate / 1000;
+    if (minr < 100000000ULL) minr = 100000000ULL;
+    _cc_min_bps = minr;
+}
+
+void RoceSrc::enable_dcqcn(linkspeed_bps ai_bps,
+                           linkspeed_bps min_bps,
+                           uint64_t byte_threshold,
+                           double g) {
+    _cc_dcqcn = true;
+    if (ai_bps > 0) _cc_ai_bps = ai_bps;
+    if (min_bps > 0) _cc_min_bps = min_bps;
+    if (byte_threshold > 0) _cc_update_byte_threshold = byte_threshold;
+    if (g > 0.0) _cc_g = g;
+    _cc_current_bps = _bitrate;
+    _cc_target_bps = _bitrate;
+    _cc_alpha = 0.0;
+    _cc_bytes_since_update = 0;
+    _cc_marked_ack_ct = 0;
+    _cc_unmarked_ack_ct = 0;
+    _cc_incstage = 0;
+    _cc_unmarked_runs = 0;
 }
 
 /*mem_b RoceSrc::queuesize(){
@@ -101,7 +136,9 @@ void RoceSrc::log_me() {
 }
 
 void RoceSrc::startflow(){
-    cout << "startflow " << _flow._name << " at " << timeAsUs(eventlist().now()) << endl;
+    static const bool _astrasim_verbose_startflow = (std::getenv("ASTRASIM_HTSIM_VERBOSE") != nullptr);
+    if (_astrasim_verbose_startflow)
+        cout << "startflow " << _flow._name << " at " << timeAsUs(eventlist().now()) << endl;
     _flow_started = true;
     _highest_sent = 0;
     _last_acked = 0;
@@ -189,7 +226,61 @@ void RoceSrc::processAck(const RoceAck& ack) {
     if (_rto < _min_rto)
         _rto = _min_rto * ((drand() * 0.5) + 0.75);
 
-    if (ackno > _last_acked) { // a brand new ack    
+    // AstraSim U3 — DCQCN AIMD CC update.  Gated on _cc_dcqcn (set by the
+    // DCQCN frontend via enable_dcqcn()).
+    if (_cc_dcqcn) {
+        uint64_t bytes_acked = 0;
+        if (ackno > _last_acked) bytes_acked = ackno - _last_acked;
+        _cc_bytes_since_update += bytes_acked;
+
+        bool marked = (ack.flags() & ECN_ECHO) != 0;
+        if (marked) _cc_marked_ack_ct++; else _cc_unmarked_ack_ct++;
+
+        _cc_alpha = (1.0 - _cc_g) * _cc_alpha + _cc_g * (marked ? 1.0 : 0.0);
+
+        bool changed = false;
+        if (marked) {
+            _cc_target_bps = _cc_current_bps;
+            double factor = 1.0 - _cc_alpha / 2.0;
+            if (factor < 0.0) factor = 0.0;
+            uint64_t new_bps = (uint64_t)(_cc_current_bps * factor);
+            if (new_bps < _cc_min_bps) new_bps = _cc_min_bps;
+            _cc_current_bps = new_bps;
+            _cc_incstage = 0;
+            _cc_unmarked_runs = 0;
+            changed = true;
+        }
+
+        if (_cc_bytes_since_update >= _cc_update_byte_threshold) {
+            bool had_marks = (_cc_marked_ack_ct > 0);
+            _cc_bytes_since_update = 0;
+            _cc_marked_ack_ct = 0;
+            _cc_unmarked_ack_ct = 0;
+            if (!had_marks) {
+                _cc_unmarked_runs++;
+                if (_cc_unmarked_runs >= 5) {
+                    uint64_t mid = (_cc_current_bps + _cc_target_bps) / 2;
+                    uint64_t new_bps = mid + _cc_ai_bps;
+                    if (new_bps > _bitrate) new_bps = _bitrate;
+                    _cc_current_bps = new_bps;
+                } else {
+                    uint64_t new_bps = _cc_current_bps + _cc_ai_bps;
+                    if (new_bps > _bitrate) new_bps = _bitrate;
+                    _cc_current_bps = new_bps;
+                }
+                _cc_incstage++;
+                changed = true;
+            }
+        }
+
+        if (changed && _cc_current_bps > 0) {
+            _packet_spacing = (simtime_picosec)(
+                (Packet::data_packet_size() + RocePacket::ACKSIZE) *
+                (pow(10.0, 12.0) * 8.0) / (double)_cc_current_bps);
+        }
+    }
+
+    if (ackno > _last_acked) { // a brand new ack
         // we should probably cancel the rtx timer for any acked by
         // the cumulative ack, but we'll get an ACK or NACK anyway in
         // due course.
@@ -200,7 +291,22 @@ void RoceSrc::processAck(const RoceAck& ack) {
     if (_log_me)
         cout << "Src " << get_id() << " ackno " << ackno << endl;
     if (ackno >= _flow_size){
-        cout << "Flow " << _name << " " << get_id() << " finished at " << timeAsUs(eventlist().now()) << " total bytes " << ackno << endl;
+        static const bool _astrasim_verbose_roce = (std::getenv("ASTRASIM_HTSIM_VERBOSE") != nullptr);
+        if (_astrasim_verbose_roce) {
+            cout << "Flow " << _name << " " << get_id() << " finished at " << timeAsUs(eventlist().now()) << " total bytes " << ackno << endl;
+        }
+        // AstraSim hook — fire send-finished callback exactly once.
+        if (astrasim_flow_finish_send_cb && !_astrasim_send_finished) {
+            _astrasim_send_finished = true;
+            int tag = _flow.flow_id();
+            int src_id = _debug_srcid;
+            int dst_id = _debug_dstid;
+            if (_astrasim_verbose_roce) {
+                std::cout << "Finish sending flow " << tag << " from " << src_id
+                          << " to " << dst_id << std::endl;
+            }
+            astrasim_flow_finish_send_cb(src_id, dst_id, _flow_size, tag);
+        }
         _done = true;
         if (_end_trigger) {
             _end_trigger->activate();
@@ -419,18 +525,33 @@ void RoceSink::receivePacket(Packet& pkt) {
     } else if (seqno < _cumulative_ack+1) {
         //must have been a bad retransmit
     }
-    send_ack(ts);
+    // AstraSim U3 — echo ECN_CE as ECN_ECHO on the ACK.
+    bool ecn_marked_here = (pkt.flags() & ECN_CE) != 0;
+    send_ack(ts, ecn_marked_here);
+    // AstraSim hook — fire receive-finished callback exactly once.
+    if (astrasim_flow_finish_recv_cb && _cumulative_ack + 1 >= _src->_flow_size
+        && !_astrasim_recv_finished) {
+        _astrasim_recv_finished = true;
+        int tag = _src->flow_id();
+        int src_id = _debug_srcid;
+        int dst_id = _debug_dstid;
+        astrasim_flow_finish_recv_cb(src_id, dst_id, _src->_flow_size, tag);
+    }
     // have we seen everything yet?
     pkt.flow().logTraffic(pkt,*this,TrafficLogger::PKT_RCVDESTROY);
     pkt.free();
 }
 
-void RoceSink::send_ack(simtime_picosec ts) {
+void RoceSink::send_ack(simtime_picosec ts, bool ecn_echo) {
     RoceAck *ack = 0;
     ack = RoceAck::newpkt(_src->_flow, *_route, _cumulative_ack,_srcaddr);
     if (_log_me)
         cout << "Sink " << get_id() << " sending ack " << _cumulative_ack << endl;
     ack->set_pathid(0);
+    // AstraSim U3 — carry ECN_ECHO if the data packet arrived with ECN_CE.
+    if (ecn_echo) {
+        ack->set_flags(ack->flags() | ECN_ECHO);
+    }
     ack->sendOn();
 }
 

@@ -10,6 +10,7 @@
 
 #include <list>
 #include <map>
+#include <vector>
 //#include "util.h"
 #include "math.h"
 #include "config.h"
@@ -104,7 +105,13 @@ public:
     void log_me();
     bool _log_me;
 
-    static uint32_t _global_node_count; 
+    // AstraSim hooks
+    void (*astrasim_flow_finish_send_cb)(int, int, int, int) = nullptr;
+    int _debug_srcid = -1;
+    int _debug_dstid = -1;
+    bool _astrasim_send_finished = false;
+
+    static uint32_t _global_node_count;
     static uint32_t _global_rto_count;  // keep track of the total number of timeouts across all srcs
 
     //HPCC specific parameters (globals)
@@ -115,7 +122,11 @@ public:
     static uint32_t _Wai;//Additive increase amount.
 
 private:
-    IntEntry _link_info[5];
+    // AstraSim (P4): was IntEntry _link_info[5].  Made a std::vector so
+    // _link_count (set from ack._int_hop) can grow beyond the upstream
+    // 3-tier FatTree assumption of 4 switch hops.  measureInFlight resizes
+    // before writing.
+    std::vector<IntEntry> _link_info;
     uint32_t _link_count;
     HPCCPacket::seq_t _last_update_seq;
     HPCCPacket::seq_t _cwnd, _flightsize, _Wc;
@@ -173,9 +184,15 @@ public:
     bool _log_me;
 
     uint32_t _srcaddr;
-    
+
+    // AstraSim hooks
+    void (*astrasim_flow_finish_recv_cb)(int, int, int, int) = nullptr;
+    int _debug_srcid = -1;
+    int _debug_dstid = -1;
+    bool _astrasim_recv_finished = false;
+
 private:
- 
+
     // Connectivity
     void connect(HPCCSrc& src, Route* route);
 

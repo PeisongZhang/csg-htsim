@@ -25,6 +25,10 @@ class Pipe : public EventSource, public PacketSink, public Drawable {
     virtual void receivePacket(Packet& pkt); // inherited from PacketSink
     virtual void doNextEvent(); // inherited from EventSource
     simtime_picosec delay() { return _delay; }
+    // AstraSim/OCS hook — dynamically change propagation delay at run time.
+    // Existing in-flight packets keep their original delivery time; only
+    // packets that enter the pipe after this call see the new delay.
+    void setDelay(simtime_picosec new_delay) { _delay = new_delay; }
     const string& nodename() { return _nodename; }
     void forceName(string name) {_nodename = name;}
     

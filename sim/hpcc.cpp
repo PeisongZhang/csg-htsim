@@ -62,7 +62,8 @@ HPCCSrc::HPCCSrc(HPCCLogger* logger, TrafficLogger* pktlogger, EventList &eventl
     _node_num = _global_node_count++;
     _nodename = "HPCCsrc " + to_string(_node_num);
 
-    srand(time(NULL));
+    // AstraSim: upstream re-seeds rand() from wall-time on every HPCCSrc ctor,
+    // same issue as RoCE.  HTSim frontend seeds once during session init.
     _pathid = random()%256;
 
     _Wai = _mss;
@@ -113,7 +114,9 @@ void HPCCSrc::log_me() {
 }
 
 void HPCCSrc::startflow(){
-    cout << "startflow " << _flow._name << " at " << timeAsUs(eventlist().now()) << endl;
+    static const bool _astrasim_verbose_startflow = (std::getenv("ASTRASIM_HTSIM_VERBOSE") != nullptr);
+    if (_astrasim_verbose_startflow)
+        cout << "startflow " << _flow._name << " at " << timeAsUs(eventlist().now()) << endl;
     _flow_started = true;
     _highest_sent = 0;
     _last_acked = 0;
@@ -208,7 +211,22 @@ void HPCCSrc::processAck(const HPCCAck& ack) {
     if (_logger) _logger->logHPCC(*this, HPCCLogger::HPCC_RCV);
 
     if (ackno >= _flow_size){
-        cout << "Flow " << _name << " finished at " << timeAsUs(eventlist().now()) << " total bytes " << ackno << endl;
+        static const bool _astrasim_verbose_hpcc = (std::getenv("ASTRASIM_HTSIM_VERBOSE") != nullptr);
+        if (_astrasim_verbose_hpcc) {
+            cout << "Flow " << _name << " finished at " << timeAsUs(eventlist().now()) << " total bytes " << ackno << endl;
+        }
+        // AstraSim hook — fire send-finished callback exactly once.
+        if (astrasim_flow_finish_send_cb && !_astrasim_send_finished) {
+            _astrasim_send_finished = true;
+            int tag = _flow.flow_id();
+            int src_id = _debug_srcid;
+            int dst_id = _debug_dstid;
+            if (_astrasim_verbose_hpcc) {
+                std::cout << "Finish sending flow " << tag << " from " << src_id
+                          << " to " << dst_id << std::endl;
+            }
+            astrasim_flow_finish_send_cb(src_id, dst_id, _flow_size, tag);
+        }
         _done = true;
         if (_end_trigger) {
             _end_trigger->activate();
@@ -374,6 +392,10 @@ double HPCCSrc::measureInFlight(const HPCCAck& ack){
     }
     else {    //reset path state
         _link_count = ack._int_hop;
+        // AstraSim (P4): grow _link_info to fit; vector-backed now.
+        if (_link_info.size() < _link_count) {
+            _link_info.resize(_link_count);
+        }
         for (i = 0;i<_link_count;i++)
             _link_info[i] = ack._int_info[i];
     }
@@ -495,7 +517,17 @@ void HPCCSink::receivePacket(Packet& pkt) {
     } else if (seqno < _cumulative_ack+1) {
         //must have been a bad retransmit
     }
-    send_ack(ts,p->_int_info, p->_int_hop);
+    // AstraSim (P4): _int_info is a std::vector — pass its data() pointer.
+    send_ack(ts, p->_int_info.data(), p->_int_hop);
+    // AstraSim hook — fire receive-finished callback exactly once.
+    if (astrasim_flow_finish_recv_cb && _cumulative_ack + 1 >= _src->_flow_size
+        && !_astrasim_recv_finished) {
+        _astrasim_recv_finished = true;
+        int tag = _src->flow_id();
+        int src_id = _debug_srcid;
+        int dst_id = _debug_dstid;
+        astrasim_flow_finish_recv_cb(src_id, dst_id, _src->_flow_size, tag);
+    }
     // have we seen everything yet?
     pkt.flow().logTraffic(pkt,*this,TrafficLogger::PKT_RCVDESTROY);
     pkt.free();

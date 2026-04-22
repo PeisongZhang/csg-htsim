@@ -60,25 +60,36 @@ LosslessInputQueue::LosslessInputQueue(EventList& eventlist,BaseQueue* peer, Swi
 
 
 void
-LosslessInputQueue::receivePacket(Packet& pkt) 
+LosslessInputQueue::receivePacket(Packet& pkt)
 {
-    /* normal packet, enqueue it */
-    _queuesize += pkt.size();
+    // AstraSim: when the very next hop in the route is the terminal sink
+    // (e.g. RoceSink/TcpSink), there is no downstream output queue to call
+    // completedService back on us, so tracking backlog here would leak and
+    // eventually stall the link via a stuck PAUSE.  Detect that case and
+    // just forward without enqueue tracking — PFC backpressure is pointless
+    // at the last hop because the sink is the consumer.
+    const bool next_is_terminal = pkt.route()
+        && (pkt.nexthop() + 1 == pkt.route()->size());
 
-    //send PAUSE notifications if that is the case!
-    assert(_queuesize > 0);
-    if ((uint64_t)_queuesize > _high_threshold && _state_recv!=PAUSED){
-        _state_recv = PAUSED;
-        sendPause(1000);
+    if (!next_is_terminal) {
+        /* normal packet, enqueue it */
+        _queuesize += pkt.size();
+
+        //send PAUSE notifications if that is the case!
+        assert(_queuesize > 0);
+        if ((uint64_t)_queuesize > _high_threshold && _state_recv!=PAUSED){
+            _state_recv = PAUSED;
+            sendPause(1000);
+        }
+
+        if (_queuesize > _maxsize){
+            static const bool _astrasim_verbose = (std::getenv("ASTRASIM_HTSIM_VERBOSE") != nullptr);
+            if (_astrasim_verbose) {
+                cout << " Queue " << _name << " LOSSLESS not working! I should have dropped this packet" << _queuesize / Packet::data_packet_size() << endl;
+            }
+        }
     }
 
-    //if (_state_recv==PAUSED)
-    //cout << timeAsMs(eventlist().now()) << " queue " << _name << " switch (" << _switch->_name << ") "<< " recv when paused pkt " << pkt.type() << " sz " << _queuesize << endl;        
-
-    if (_queuesize > _maxsize){
-        cout << " Queue " << _name << " LOSSLESS not working! I should have dropped this packet" << _queuesize / Packet::data_packet_size() << endl;
-    }
-    
     //tell the output queue we're here!
     if (pkt.nexthop() < pkt.route()->size()){
         //this should not work...
@@ -104,7 +115,12 @@ void LosslessInputQueue::completedService(Packet& pkt){
 }
 
 void LosslessInputQueue::sendPause(unsigned int wait){
-    //cout << "Ingress link " << getRemoteEndpoint() << " PAUSE " << wait << endl;    
+    static const bool _astrasim_verbose = (std::getenv("ASTRASIM_HTSIM_VERBOSE") != nullptr);
+    if (_astrasim_verbose) {
+        cout << "[pfc] t=" << (eventlist().now() / 1e6) << "us "
+             << _nodename << " sendPause wait=" << wait
+             << " qsize=" << _queuesize << endl;
+    }
     uint32_t switchID = 0;
     if (_switch)
         switchID = getSwitch()->getID();

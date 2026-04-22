@@ -6,8 +6,7 @@ PacketDB<HPCCAck> HPCCAck::_packetdb;
 PacketDB<HPCCNack> HPCCNack::_packetdb;
 
 void HPCCAck::copy_int_info(IntEntry* info, int cnt){
-    for (int i = 0;i<cnt;i++)
-        _int_info[i] = info[i];
-        
+    // AstraSim (P4): _int_info is a std::vector now — assign grows as needed.
+    _int_info.assign(info, info + cnt);
     _int_hop = cnt;
 };

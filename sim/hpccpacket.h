@@ -3,6 +3,7 @@
 #define HPCCPACKET_H
 
 #include <list>
+#include <vector>
 #include "network.h"
 
 // NdpPacket and NdpAck are subclasses of Packet.
@@ -71,7 +72,7 @@ public:
   
     void free() {_packetdb.freePacket(this);}
     virtual ~HPCCPacket(){}
-    
+
     inline seq_t seqno() const {return _seqno;}
     inline bool retransmitted() const {return _retransmitted;}
     inline bool last_packet() const {return _last_packet;}
@@ -79,7 +80,15 @@ public:
     inline void set_ts(simtime_picosec ts) {_ts = ts;}
     inline uint32_t path_id() const {if (_pathid!=UINT32_MAX) return _pathid; else return _route->path_id();}
     virtual PktPriority priority() const {return Packet::PRIO_LO;}
-    IntEntry _int_info[5];
+    // AstraSim (P4): upstream caps HPCC INT entries at 5, assuming a 3-tier
+    // FatTree fabric (max 4 switch hops).  ASTRA-sim topologies can traverse
+    // arbitrarily deep paths; switch to std::vector so deeper paths grow
+    // dynamically at each hop and we don't have to recompile to change
+    // INT capacity.  queue_lossless_output resizes before writing; packets
+    // pooled via PacketDB keep their vectors between uses — this is fine
+    // because writes always advance _int_hop from 0 and callers never read
+    // past _int_hop.
+    std::vector<IntEntry> _int_info;
     uint32_t _int_hop;
     const static int ACKSIZE=64;
 protected:
@@ -120,7 +129,8 @@ public:
   
     virtual ~HPCCAck(){}
 
-    IntEntry _int_info[5];
+    // AstraSim (P4): see matching comment on HPCCPacket._int_info.
+    std::vector<IntEntry> _int_info;
     uint32_t _int_hop;
 protected:
     seq_t _ackno;

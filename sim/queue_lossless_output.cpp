@@ -30,11 +30,16 @@ LosslessOutputQueue::LosslessOutputQueue(linkspeed_bps bitrate, mem_b maxsize,
 
 void
 LosslessOutputQueue::receivePacket(Packet& pkt){
-    if (pkt.type()==ETH_PAUSE)
+    if (pkt.type()==ETH_PAUSE) {
         receivePacket(pkt,NULL);
-    else {
-        LosslessInputQueue* q = pkt.get_ingress_queue();
-        pkt.clear_ingress_queue();
+    } else {
+        // AstraSim: 1-arg receivePacket is used for the FIRST hop too,
+        // where the sender (RoceSrc/TcpSrc) invokes sendOn() without
+        // routing through a LosslessInputQueue.  In that case the packet
+        // carries no ingress queue — pass NULL through to the 2-arg form
+        // (which has been patched to accept null).
+        LosslessInputQueue* q = pkt.has_ingress_queue() ? pkt.get_ingress_queue() : NULL;
+        if (q) pkt.clear_ingress_queue();
         receivePacket(pkt,dynamic_cast<VirtualQueue*>(q));
     }
 }
@@ -74,7 +79,11 @@ LosslessOutputQueue::receivePacket(Packet& pkt,VirtualQueue* prev)
     /* normal packet, enqueue it */
 
     //remember the virtual queue that has sent us this packet; will notify the vq once the packet has left our buffer.
-    assert(prev!=NULL);
+    // AstraSim: the first hop from a sender (e.g. RoceSrc) enters the route
+    // via Packet::sendOn() which calls receivePacket(pkt) — 1-arg — without
+    // any ingress VirtualQueue.  Accept that case by pushing a nullptr into
+    // _vq; completeService skips the completedService notification when it
+    // pops a null.
 
     pkt.flow().logTraffic(pkt, *this, TrafficLogger::PKT_ARRIVE);
 
@@ -87,7 +96,13 @@ LosslessOutputQueue::receivePacket(Packet& pkt,VirtualQueue* prev)
     _queuesize += pkt.size();
 
     if (_queuesize > _maxsize){
-        cout << " Queue " << _name << " LOSSLESS not working! I should have dropped this packet" << _queuesize / Packet::data_packet_size() << endl;
+        // AstraSim: only spam stdout when verbose.  The "should have dropped"
+        // indicates PFC thresholds are set too high for this workload —
+        // tune ASTRASIM_HTSIM_PFC_HIGH_KB / LOW_KB downwards.
+        static const bool _astrasim_verbose = (std::getenv("ASTRASIM_HTSIM_VERBOSE") != nullptr);
+        if (_astrasim_verbose) {
+            cout << " Queue " << _name << " LOSSLESS not working! I should have dropped this packet" << _queuesize / Packet::data_packet_size() << endl;
+        }
     }
 
     if (_logger) 
@@ -124,7 +139,13 @@ void LosslessOutputQueue::completeService(){
     if (pkt->type()==HPCC){
         //HPPC INT information adding to packet
         HPCCPacket* h = dynamic_cast<HPCCPacket*>(pkt);
-        assert(h->_int_hop<5);
+        // AstraSim (P4): _int_info is now a std::vector — grow as needed
+        // so paths deeper than the upstream 3-tier FatTree assumption
+        // don't trip an assertion.  Packets pooled via PacketDB keep their
+        // vector between uses; resize() never shrinks.
+        if (h->_int_info.size() <= h->_int_hop) {
+            h->_int_info.resize(h->_int_hop + 1);
+        }
 
         h->_int_info[h->_int_hop]._queuesize = _queuesize;
         h->_int_info[h->_int_hop]._ts = eventlist().now();
@@ -147,8 +168,10 @@ void LosslessOutputQueue::completeService(){
 
     if (_logger) _logger->logQueue(*this, QueueLogger::PKT_SERVICE, *pkt);
 
-    //tell the virtual input queue this packet is done!
-    q->completedService(*pkt);
+    // AstraSim: on the first hop the upstream is a RoceSrc (not a
+    // VirtualQueue) and `q` is nullptr — skip the backpressure notify in
+    // that case.  Every other hop has a valid LosslessInputQueue peer.
+    if (q) q->completedService(*pkt);
 
     //this is used for bandwidth utilization tracking. 
     log_packet_send(drainTime(pkt));
